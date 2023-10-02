@@ -1,9 +1,4 @@
-#include "Python.h"
-#include "pycore_initconfig.h"    // _PyStatus_ERR
-#include "pycore_pyerrors.h"      // _Py_DumpExtensionModules
-#include "pycore_pystate.h"       // _PyThreadState_GET()
-#include "pycore_signal.h"        // Py_NSIG
-#include "pycore_traceback.h"     // _Py_DumpTracebackThreads
+#include <Python.h>
 
 #include <object.h>
 #include <signal.h>
@@ -64,6 +59,40 @@ typedef struct sigaction _Py_sighandler_t;
 #else
 typedef PyOS_sighandler_t _Py_sighandler_t;
 #endif
+
+/* Py_NSIG is normally defined in pycore_signal.h, but we can't import that
+header from a third-party extension module, so we copy the definition here. */
+#ifdef _SIG_MAXSIG
+   // gh-91145: On FreeBSD, <signal.h> defines NSIG as 32: it doesn't include
+   // realtime signals: [SIGRTMIN,SIGRTMAX]. Use _SIG_MAXSIG instead. For
+   // example on x86-64 FreeBSD 13, SIGRTMAX is 126 and _SIG_MAXSIG is 128.
+#  define Py_NSIG _SIG_MAXSIG
+#elif defined(NSIG)
+#  define Py_NSIG NSIG
+#elif defined(_NSIG)
+#  define Py_NSIG _NSIG            // BSD/SysV
+#elif defined(_SIGMAX)
+#  define Py_NSIG (_SIGMAX + 1)    // QNX
+#elif defined(SIGMAX)
+#  define Py_NSIG (SIGMAX + 1)     // djgpp
+#else
+#  define Py_NSIG 64               // Use a reasonable default value
+#endif
+
+/* The built-in faulthandler module uses these internal Python functions for
+printing stack traces. We steal them here. */
+extern void _Py_DumpExtensionModules(int fd, PyInterpreterState *interp);
+extern const char* _Py_DumpTracebackThreads(
+    int fd,
+    PyInterpreterState *interp,
+    PyThreadState *current_tstate);
+extern void _Py_DumpTraceback(
+    int fd,
+    PyThreadState *tstate);
+extern Py_ssize_t _Py_write_noraise(
+    int fd,
+    const void *buf,
+    size_t count);
 
 typedef struct {
     int signum;
@@ -158,8 +187,7 @@ cfaulthandler_get_fileno(PyObject **file_ptr)
     PyObject *file = *file_ptr;
 
     if (file == NULL || file == Py_None) {
-        PyThreadState *tstate = _PyThreadState_GET();
-        file = _PySys_GetAttr(tstate, &_Py_ID(stderr));
+        file = PySys_GetObject("stderr");
         if (file == NULL) {
             PyErr_SetString(PyExc_RuntimeError, "unable to get sys.stderr");
             return -1;
@@ -182,7 +210,7 @@ cfaulthandler_get_fileno(PyObject **file_ptr)
         return fd;
     }
 
-    result = PyObject_CallMethodNoArgs(file, &_Py_ID(fileno));
+    result = PyObject_CallMethod(file, "fileno", "");
     if (result == NULL)
         return -1;
 
@@ -200,7 +228,7 @@ cfaulthandler_get_fileno(PyObject **file_ptr)
         return -1;
     }
 
-    result = PyObject_CallMethodNoArgs(file, &_Py_ID(flush));
+    result = PyObject_CallMethod(file, "flush", "");
     if (result != NULL)
         Py_DECREF(result);
     else {
@@ -216,7 +244,7 @@ cfaulthandler_get_fileno(PyObject **file_ptr)
 static PyThreadState*
 get_thread_state(void)
 {
-    PyThreadState *tstate = _PyThreadState_GET();
+    PyThreadState *tstate = _PyThreadState_UncheckedGet();
     if (tstate == NULL) {
         /* just in case but very unlikely... */
         PyErr_SetString(PyExc_RuntimeError,
@@ -1296,8 +1324,50 @@ static PyMethodDef module_methods[] = {
     {NULL, NULL}  /* sentinel */
 };
 
+static int cfaulthandler_module_initialized = 0;
+
+/* Note on initialization/finalization in cfaulthandler vs faulthandler:
+The builtin faulthandler module is compiled into the Python interpreter, and
+the Python interpreter automatically calls a special _PyFaulthandler_Init()
+function on interpreter startup. cfaulthandler isn't built into the
+interpreter, so we do this initialization when the cfaulthandler module is
+loaded instead. Same with finalization. */
+
 static int
 PyExec_cfaulthandler(PyObject *module) {
+    /* cfaulthandler uses static globals to store state. If multiple Python
+    interpreters were running in the same process, and they all imported the
+    cfaulthandler module, this could lead to odd bugs. For now we just ban
+    this. (The builtin faulthandler module doesn't ban this; I think this is a
+    bug in the builtin faulthandler mdoule?)*/
+    if (cfaulthandler_module_initialized) {
+        PyErr_SetString(PyExc_ImportError,
+                        "can't load cfaulthandler more than once per process");
+        return -1;
+    }
+    cfaulthandler_module_initialized = 1;
+
+#ifdef CFAULTHANDLER_USE_ALT_STACK
+    memset(&stack, 0, sizeof(stack));
+    stack.ss_flags = 0;
+    /* bpo-21131: allocate dedicated stack of SIGSTKSZ*2 bytes, instead of just
+       SIGSTKSZ bytes. Calling the previous signal handler in cfaulthandler
+       signal handler uses more than SIGSTKSZ bytes of stack memory on some
+       platforms. */
+    stack.ss_size = SIGSTKSZ * 2;
+#ifdef AT_MINSIGSTKSZ
+    /* bpo-46968: Query Linux for minimal stack size to ensure signal delivery
+       for the hardware running CPython. This OS feature is available in
+       Linux kernel version >= 5.14 */
+    unsigned long at_minstack_size = getauxval(AT_MINSIGSTKSZ);
+    if (at_minstack_size != 0) {
+        stack.ss_size = SIGSTKSZ + at_minstack_size;
+    }
+#endif
+#endif
+
+    memset(&thread, 0, sizeof(thread));
+
     /* Add constants for unit tests */
 #ifdef MS_WINDOWS
     /* RaiseException() codes (prefixed by an underscore) */
@@ -1327,78 +1397,12 @@ PyExec_cfaulthandler(PyObject *module) {
     return 0;
 }
 
-static PyModuleDef_Slot cfaulthandler_slots[] = {
-    {Py_mod_exec, PyExec_cfaulthandler},
-    {0, NULL}
-};
 
-static struct PyModuleDef module_def = {
-    PyModuleDef_HEAD_INIT,
-    .m_name = "cfaulthandler",
-    .m_doc = module_doc,
-    .m_methods = module_methods,
-    .m_traverse = cfaulthandler_traverse,
-    .m_slots = cfaulthandler_slots
-};
-
-PyMODINIT_FUNC
-PyInit_cfaulthandler(void)
+static void
+cfaulthandler_free(void *module)
 {
-    return PyModuleDef_Init(&module_def);
-}
+    (void)module;
 
-static int
-cfaulthandler_init_enable(void)
-{
-    PyObject *module = PyImport_ImportModule("cfaulthandler");
-    if (module == NULL) {
-        return -1;
-    }
-
-    PyObject *res = PyObject_CallMethodNoArgs(module, &_Py_ID(enable));
-    Py_DECREF(module);
-    if (res == NULL) {
-        return -1;
-    }
-    Py_DECREF(res);
-
-    return 0;
-}
-
-PyStatus
-_PyCFaulthandler_Init(int enable)
-{
-#ifdef CFAULTHANDLER_USE_ALT_STACK
-    memset(&stack, 0, sizeof(stack));
-    stack.ss_flags = 0;
-    /* bpo-21131: allocate dedicated stack of SIGSTKSZ*2 bytes, instead of just
-       SIGSTKSZ bytes. Calling the previous signal handler in cfaulthandler
-       signal handler uses more than SIGSTKSZ bytes of stack memory on some
-       platforms. */
-    stack.ss_size = SIGSTKSZ * 2;
-#ifdef AT_MINSIGSTKSZ
-    /* bpo-46968: Query Linux for minimal stack size to ensure signal delivery
-       for the hardware running CPython. This OS feature is available in
-       Linux kernel version >= 5.14 */
-    unsigned long at_minstack_size = getauxval(AT_MINSIGSTKSZ);
-    if (at_minstack_size != 0) {
-        stack.ss_size = SIGSTKSZ + at_minstack_size;
-    }
-#endif
-#endif
-
-    memset(&thread, 0, sizeof(thread));
-
-    if (enable) {
-        if (cfaulthandler_init_enable() < 0) {
-            return _PyStatus_ERR("failed to enable cfaulthandler");
-        }
-    }
-    return _PyStatus_OK();
-}
-
-void _PyCFaulthandler_Fini(void)
-{
     /* later */
     if (thread.cancel_event) {
         cancel_dump_traceback_later();
@@ -1446,4 +1450,27 @@ void _PyCFaulthandler_Fini(void)
         stack.ss_sp = NULL;
     }
 #endif
+
+    cfaulthandler_module_initialized = 0;
+}
+
+static PyModuleDef_Slot cfaulthandler_slots[] = {
+    {Py_mod_exec, PyExec_cfaulthandler},
+    {0, NULL}
+};
+
+static struct PyModuleDef module_def = {
+    PyModuleDef_HEAD_INIT,
+    .m_name = "cfaulthandler",
+    .m_doc = module_doc,
+    .m_methods = module_methods,
+    .m_traverse = cfaulthandler_traverse,
+    .m_slots = cfaulthandler_slots,
+    .m_free = cfaulthandler_free
+};
+
+PyMODINIT_FUNC
+PyInit_cfaulthandler(void)
+{
+    return PyModuleDef_Init(&module_def);
 }
