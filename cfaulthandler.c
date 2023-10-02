@@ -1,3 +1,17 @@
+/*
+Note: cfaulthandler.c was forked from the builtin Python module faulthandler.c:
+https://github.com/python/cpython/blob/v3.11.5/Modules/faulthandler.c
+
+The main change is to print the C call stack in addition to the Python call
+stack. In addition, some changes were needed to adapt cfaulthandler to run as a
+3rd-party module, rather than being built into the Python interpreter like
+faulthandler is.
+
+Copyright (c) 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010,
+2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023
+Python Software Foundation; All Rights Reserved
+*/
+
 #include <Python.h>
 
 #include <execinfo.h>
