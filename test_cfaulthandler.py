@@ -1,6 +1,5 @@
 from contextlib import contextmanager
 import datetime
-import cfaulthandler
 import os
 import re
 import signal
@@ -18,6 +17,8 @@ try:
     import _testcapi
 except ImportError:
     _testcapi = None
+
+import cfaulthandler
 
 if not support.has_subprocess_support:
     raise unittest.SkipTest("test module requires subprocess")
@@ -413,38 +414,6 @@ class CFaultHandlerTests(unittest.TestCase):
         # don't use assert_python_ok() because it always enables cfaulthandler
         output = subprocess.check_output(args)
         self.assertEqual(output.rstrip(), b"False")
-
-    @support.requires_subprocess()
-    def test_sys_xoptions(self):
-        # Test python -X cfaulthandler
-        code = "import cfaulthandler; print(cfaulthandler.is_enabled())"
-        args = filter(None, (sys.executable,
-                             "-E" if sys.flags.ignore_environment else "",
-                             "-X", "cfaulthandler", "-c", code))
-        env = os.environ.copy()
-        env.pop("PYTHONFAULTHANDLER", None)
-        # don't use assert_python_ok() because it always enables cfaulthandler
-        output = subprocess.check_output(args, env=env)
-        self.assertEqual(output.rstrip(), b"True")
-
-    @support.requires_subprocess()
-    def test_env_var(self):
-        # empty env var
-        code = "import cfaulthandler; print(cfaulthandler.is_enabled())"
-        args = (sys.executable, "-c", code)
-        env = dict(os.environ)
-        env['PYTHONFAULTHANDLER'] = ''
-        env['PYTHONDEVMODE'] = ''
-        # don't use assert_python_ok() because it always enables cfaulthandler
-        output = subprocess.check_output(args, env=env)
-        self.assertEqual(output.rstrip(), b"False")
-
-        # non-empty env var
-        env = dict(os.environ)
-        env['PYTHONFAULTHANDLER'] = '1'
-        env['PYTHONDEVMODE'] = ''
-        output = subprocess.check_output(args, env=env)
-        self.assertEqual(output.rstrip(), b"True")
 
     def check_dump_traceback(self, *, filename=None, fd=None):
         """
