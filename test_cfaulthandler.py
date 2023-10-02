@@ -27,14 +27,18 @@ TIMEOUT = 0.5
 MS_WINDOWS = (os.name == 'nt')
 
 
-def expected_traceback(lineno1, lineno2, header, min_count=1):
+def expected_traceback(lineno1, lineno2, header, min_count=1, *, c_call_stack=True):
     regex = header
     regex += '  File "<string>", line %s in func\n' % lineno1
     regex += '  File "<string>", line %s in <module>' % lineno2
     if 1 < min_count:
+        assert not c_call_stack
         return '^' + (regex + '\n') * (min_count - 1) + regex
     else:
-        return '^' + regex + '$'
+        if c_call_stack:
+            return '^' + regex + "\n\nCurrent thread's C call stack"
+        else:
+            return '^' + regex + '$'
 
 def skip_segfault_on_android(test):
     # Issue #32138: Raising SIGSEGV on Android may not cause a crash.
@@ -89,6 +93,7 @@ class CFaultHandlerTests(unittest.TestCase):
                     fd=None, know_current_thread=True,
                     py_fatal_error=False,
                     garbage_collecting=False,
+                    c_call_stack=True,
                     function='<module>'):
         """
         Check that the fault handler for fatal errors is enabled and check the
@@ -110,7 +115,19 @@ class CFaultHandlerTests(unittest.TestCase):
         regex.append(fr'{header} \(most recent call first\):')
         if garbage_collecting:
             regex.append('  Garbage-collecting')
-        regex.append(fr'  File "<string>", line {lineno} in {function}')
+        regex.append(
+            fr'  File "<string>", line {lineno} in {function}'
+            r'(?:\n  File "<string>", line \d+ in .*)*'
+        )
+        if c_call_stack:
+            regex.append('')
+            regex.append(r"Current thread's C call stack \(most recent call first\):")
+            regex.append(
+                # First line should always be in the cfaulthandler shared library
+                fr"{re.escape(cfaulthandler.__file__)}\(.*\+0x[0-9a-f]+\)\[0x[0-9a-f]+\]"
+                # Remaining lines could be anywhere
+                r"(?:\n.*(?:\(.*\+0x[0-9a-f]+\))?\[0x[0-9a-f]+\])+"
+            )
         regex = '\n'.join(regex)
 
         if other_regex:
@@ -212,7 +229,8 @@ class CFaultHandlerTests(unittest.TestCase):
             'in new thread',
             know_current_thread=False,
             func='cfaulthandler_fatal_error_thread',
-            py_fatal_error=True)
+            py_fatal_error=True,
+            c_call_stack=False)
 
     def test_sigabrt(self):
         self.check_fatal_error("""
@@ -272,7 +290,8 @@ class CFaultHandlerTests(unittest.TestCase):
                 2,
                 'xyz',
                 func='test_fatal_error',
-                py_fatal_error=True)
+                py_fatal_error=True,
+                c_call_stack=False)
 
     def test_fatal_error(self):
         self.check_fatal_error_func(False)
@@ -451,14 +470,17 @@ class CFaultHandlerTests(unittest.TestCase):
             lineno = 11
         else:
             lineno = 14
-        expected = [
+        expected_start = [
             'Stack (most recent call first):',
             '  File "<string>", line %s in funcB' % lineno,
             '  File "<string>", line 17 in funcA',
-            '  File "<string>", line 19 in <module>'
+            '  File "<string>", line 19 in <module>',
+            '',
+            "Current thread's C call stack (most recent call first):",
         ]
         trace, exitcode = self.get_output(code, filename, fd)
-        self.assertEqual(trace, expected)
+        self.assertEqual(trace[:len(expected_start)], expected_start)
+        self.assertRegex(trace[len(expected_start)], fr"{re.escape(cfaulthandler.__file__)}\(.*\+0x[0-9a-f]+\)\[0x[0-9a-f]+\]")
         self.assertEqual(exitcode, 0)
 
     def test_dump_traceback(self):
@@ -495,7 +517,7 @@ class CFaultHandlerTests(unittest.TestCase):
             '  File "<string>", line 6 in <module>'
         ]
         trace, exitcode = self.get_output(code)
-        self.assertEqual(trace, expected)
+        self.assertEqual(trace[:len(expected)], expected)
         self.assertEqual(exitcode, 0)
 
     def check_dump_traceback_threads(self, filename):
@@ -551,7 +573,9 @@ class CFaultHandlerTests(unittest.TestCase):
 
             Current thread 0x[0-9a-f]+ \(most recent call first\):
               File "<string>", line {lineno} in dump
-              File "<string>", line 28 in <module>$
+              File "<string>", line 28 in <module>
+
+            Current thread's C call stack \(most recent call first\):
             """
         regex = dedent(regex.format(lineno=lineno)).strip()
         self.assertRegex(output, regex)
@@ -620,7 +644,7 @@ class CFaultHandlerTests(unittest.TestCase):
             if repeat:
                 count *= 2
             header = r'Timeout \(%s\)!\nThread 0x[0-9a-f]+ \(most recent call first\):\n' % timeout_str
-            regex = expected_traceback(17, 26, header, min_count=count)
+            regex = expected_traceback(17, 26, header, min_count=count, c_call_stack=False)
             self.assertRegex(trace, regex)
         else:
             self.assertEqual(trace, '')
